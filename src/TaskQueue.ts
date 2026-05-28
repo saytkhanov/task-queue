@@ -1,4 +1,4 @@
-import { QueueClosedError } from "./errors.js";
+import { QueueClosedError, TaskCanceledError } from "./errors.js";
 
 export type TaskKey = string;
 
@@ -44,36 +44,13 @@ interface QueueItem<T> {
   started: boolean;
 }
 
-const defaultClock: Clock = {
-  sleep(ms: number, signal?: AbortSignal): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      if (signal?.aborted) {
-        reject(signal.reason);
-        return;
-      }
-      const timer = setTimeout(() => {
-        signal?.removeEventListener("abort", onAbort);
-        resolve();
-      }, ms);
-      const onAbort = () => {
-        clearTimeout(timer);
-        reject(signal?.reason);
-      };
-      signal?.addEventListener("abort", onAbort, { once: true });
-    });
-  },
-  random(): number {
-    return Math.random();
-  }
-};
-
 export class TaskQueue {
   private readonly concurrency: number;
   private readonly retries: number;
   private readonly baseDelayMs: number;
   private readonly maxDelayMs: number;
   private readonly jitterRatio: number;
-  private readonly clock: Clock;
+  private readonly customClock?: Clock;
 
   private readonly queue: QueueItem<unknown>[] = [];
   private readonly inFlight = new Map<TaskKey, QueueItem<unknown>>();
@@ -99,7 +76,7 @@ export class TaskQueue {
       baseDelayMs = 100,
       maxDelayMs = 30_000,
       jitterRatio = 0.2,
-      clock = defaultClock
+      clock
     } = options;
 
     if (!Number.isInteger(concurrency) || concurrency <= 0) {
@@ -123,7 +100,7 @@ export class TaskQueue {
     this.baseDelayMs = baseDelayMs;
     this.maxDelayMs = maxDelayMs;
     this.jitterRatio = jitterRatio;
-    this.clock = clock;
+    this.customClock = clock;
   }
 
   add<T>(key: TaskKey, task: (ctx: TaskContext) => Promise<T>): Promise<T> {
@@ -194,9 +171,64 @@ export class TaskQueue {
   }
 
   private async executeWithRetries<T>(item: QueueItem<T>): Promise<T> {
-    // Retry / backoff logic is implemented in a later stage.
-    const ctx: TaskContext = { signal: item.controller.signal, attempt: 1 };
-    return item.task(ctx);
+    const maxAttempts = 1 + this.retries;
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await item.task({
+          signal: item.controller.signal,
+          attempt
+        });
+      } catch (error) {
+        if (attempt >= maxAttempts) {
+          throw error;
+        }
+        this.counters.retried += 1;
+        const delay = this.calculateDelay(attempt);
+        await this.sleep(delay, item.controller.signal);
+      }
+    }
+  }
+
+  private calculateDelay(attempt: number): number {
+    const exponential = this.baseDelayMs * 2 ** (attempt - 1);
+    const capped = Math.min(exponential, this.maxDelayMs);
+
+    if (this.jitterRatio === 0) {
+      return capped;
+    }
+
+    const random = this.customClock?.random ? this.customClock.random() : Math.random();
+    // factor in [1 - jitterRatio, 1 + jitterRatio]
+    const factor = 1 - this.jitterRatio + random * (2 * this.jitterRatio);
+    return capped * factor;
+  }
+
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new TaskCanceledError());
+    }
+
+    if (this.customClock) {
+      return this.customClock.sleep(ms, signal).catch((error: unknown) => {
+        if (signal?.aborted) {
+          throw new TaskCanceledError();
+        }
+        throw error;
+      });
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new TaskCanceledError());
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private maybeResolveShutdown(): void {
