@@ -9,9 +9,6 @@ export interface TaskQueueOptions {
   maxDelayMs?: number;
   jitterRatio?: number;
 
-  /**
-   * Internal testing hook
-   */
   clock?: {
     sleep(ms: number, signal?: AbortSignal): Promise<void>;
     random(): number;
@@ -199,7 +196,6 @@ export class TaskQueue {
     }
 
     const random = this.customClock?.random ? this.customClock.random() : Math.random();
-    // factor in [1 - jitterRatio, 1 + jitterRatio]
     const factor = 1 - this.jitterRatio + random * (2 * this.jitterRatio);
     return capped * factor;
   }
@@ -232,18 +228,35 @@ export class TaskQueue {
   }
 
   private maybeResolveShutdown(): void {
-    if (this.closing && this.activeCount === 0 && this.queue.length === 0) {
-      this.resolveShutdown?.();
+    if (this.closing && this.activeCount === 0 && this.resolveShutdown) {
+      this.resolveShutdown();
+      this.resolveShutdown = undefined;
     }
   }
 
   shutdown(): Promise<void> {
-    if (!this.shutdownPromise) {
-      this.shutdownPromise = new Promise<void>((resolve) => {
-        this.resolveShutdown = resolve;
-      });
+    if (this.shutdownPromise) {
+      return this.shutdownPromise;
     }
+
     this.closing = true;
+
+    const pending = this.queue.splice(0, this.queue.length);
+    for (const item of pending) {
+      item.controller.abort(new TaskCanceledError());
+      this.inFlight.delete(item.key);
+      item.reject(new TaskCanceledError());
+      this.counters.canceled += 1;
+    }
+
+    if (this.activeCount === 0) {
+      this.shutdownPromise = Promise.resolve();
+      return this.shutdownPromise;
+    }
+
+    this.shutdownPromise = new Promise<void>((resolve) => {
+      this.resolveShutdown = resolve;
+    });
     return this.shutdownPromise;
   }
 
