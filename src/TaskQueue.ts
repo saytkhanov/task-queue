@@ -1,3 +1,5 @@
+import { QueueClosedError } from "./errors.js";
+
 export type TaskKey = string;
 
 export interface TaskQueueOptions {
@@ -125,6 +127,16 @@ export class TaskQueue {
   }
 
   add<T>(key: TaskKey, task: (ctx: TaskContext) => Promise<T>): Promise<T> {
+    if (this.closing) {
+      return Promise.reject(new QueueClosedError());
+    }
+
+    const existing = this.inFlight.get(key);
+    if (existing) {
+      this.counters.deduplicated++;
+      return existing.promise as Promise<T>;
+    }
+
     let resolve!: (value: T) => void;
     let reject!: (reason: unknown) => void;
     const promise = new Promise<T>((res, rej) => {
@@ -142,9 +154,17 @@ export class TaskQueue {
       started: false
     };
 
-    void item; // wiring into the scheduler is implemented in a later stage
+    this.queue.push(item as QueueItem<unknown>);
+    this.inFlight.set(key, item as QueueItem<unknown>);
+    this.counters.enqueued++;
+
+    this.drain();
 
     return promise;
+  }
+
+  private drain(): void {
+    // Scheduling loop is implemented in a later stage.
   }
 
   shutdown(): Promise<void> {
