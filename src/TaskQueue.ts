@@ -164,7 +164,45 @@ export class TaskQueue {
   }
 
   private drain(): void {
-    // Scheduling loop is implemented in a later stage.
+    while (!this.closing && this.activeCount < this.concurrency && this.queue.length > 0) {
+      const item = this.queue.shift();
+      if (!item) return;
+
+      item.started = true;
+      this.activeCount += 1;
+      this.counters.started += 1;
+
+      void this.runItem(item);
+    }
+
+    this.maybeResolveShutdown();
+  }
+
+  private async runItem<T>(item: QueueItem<T>): Promise<void> {
+    try {
+      const result = await this.executeWithRetries(item);
+      item.resolve(result);
+    } catch (error) {
+      this.counters.failed += 1;
+      item.reject(error);
+    } finally {
+      this.inFlight.delete(item.key);
+      this.activeCount -= 1;
+      this.drain();
+      this.maybeResolveShutdown();
+    }
+  }
+
+  private async executeWithRetries<T>(item: QueueItem<T>): Promise<T> {
+    // Retry / backoff logic is implemented in a later stage.
+    const ctx: TaskContext = { signal: item.controller.signal, attempt: 1 };
+    return item.task(ctx);
+  }
+
+  private maybeResolveShutdown(): void {
+    if (this.closing && this.activeCount === 0 && this.queue.length === 0) {
+      this.resolveShutdown?.();
+    }
   }
 
   shutdown(): Promise<void> {
