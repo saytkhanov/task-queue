@@ -1,3 +1,5 @@
+// ФИО: Shamil Saitkhanov
+
 import { QueueClosedError, TaskCanceledError } from "./errors.js";
 
 export type TaskKey = string;

@@ -1,3 +1,5 @@
+// ФИО: Shamil Saitkhanov
+
 export class QueueClosedError extends Error {
   constructor(message = "Queue is closed") {
     super(message);
